@@ -1,0 +1,9 @@
+[Unit]
+Description=Publish verified MARA block data for the public explorer
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/slipstreambot
+ExecStart=%h/slipstreambot/.venv/bin/python explorer-site/publish_data.py --config config.toml --checkout state/public-archive
+Environment=GIT_TERMINAL_PROMPT=0
+Nice=10

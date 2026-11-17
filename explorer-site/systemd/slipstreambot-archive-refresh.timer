@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the MARA pool index for delayed entries and chain changes daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

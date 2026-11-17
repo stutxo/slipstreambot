@@ -56,11 +56,44 @@ With the watcher running, start the explorer in a second terminal and open [the 
 uv run slipstreambot --config config.toml explore
 ```
 
-The page reads the watcher's SQLite reports every 30 seconds and shows up to 50 recent MARA blocks, newest first. Expand a block to see its local mempool coverage and the evidence for each highlighted transaction. Policy findings also show how the exceptions compare with MARA's published rules. Select **Flagged blocks** to show blocks with either signal, or **Mempool misses** to show covered blocks containing a transaction the node did not observe. On mainnet, block hashes and transaction IDs link to mempool.space.
+The page combines live MARA reports with the historical archive and shows 50 blocks per page, newest first. Filters run across the whole archive. Each expanded block has a permalink that opens the same block on a fresh visit. Expand a block to see its local mempool coverage and the evidence for each highlighted transaction. Policy findings also show how the exceptions compare with MARA's published rules. Select **Flagged blocks** to show blocks with either signal, or **Mempool misses** to show covered blocks containing a transaction the node did not observe. On mainnet, block hashes and transaction IDs link to mempool.space.
 
 The server binds to loopback and reads the configured state database even when the watcher is offline. The footer shows the last scanned height. Use `explore --port 8081` to select another port.
 
-For static hosting, run `uv run python explorer-site/build.py --config config.toml` and serve `explorer-site/dist/`. The snapshot records its export time in UTC.
+### Historical archive
+
+Run the indexer and analyzer alongside the watcher on an unpruned mainnet node. Each command resumes from its saved progress in `archive.sqlite3` beside the watcher database. They use read-only Bitcoin RPC and write only to the archive. Running the indexer again refreshes the tip and rechecks an overlap for late attributions.
+
+```sh
+uv run python -m slipstreambot.archive_index --config config.toml
+uv run python -m slipstreambot.archive_analyze --config config.toml --workers 4
+```
+
+The indexer pages through mempool.space’s MARA pool index. It verifies each candidate against the active chain, reads the coinbase transaction, and saves the matching tag or known payout address. The analyzer retrieves previous outputs using `getblock` verbosity 3 and checks each non-coinbase transaction. The list is browsable as soon as coinbases have been verified. Pending transaction analysis is displayed separately from a completed report with zero findings. Live evidence takes precedence for the same active block. [MARA pool index](https://mempool.space/mining/pool/marapool) · [Pool attribution registry](https://github.com/mempool/mining-pools/blob/master/pools-v2.json)
+
+Historical checks use the project's pinned policy rules. Before MARA announced Slipstream on February 22, 2024, the explorer labels findings as policy exceptions. Local mempool coverage requires a contemporaneous watcher observation. [Slipstream launch announcement](https://ir.mara.com/news-events/press-releases/detail/1343/marathon-digital-holdings-launches-slipstream)
+
+### Public archive updates
+
+For a self-contained static snapshot, run `uv run python explorer-site/build.py --config config.toml` and serve `explorer-site/dist/`. The build emits a summary index in `archive.json`, block details grouped by height under `details/`, and a recent-block feed in `blocks.json`.
+
+The [public explorer](https://mara-slipstream-blocks.xenocardo.chatgpt.site/) reads updated JSON from this repository’s dedicated `archive-data` branch. The `--data-base` build option selects the public HTTPS directory for these files. The publisher exports only block data, skips commits when the visible data is unchanged, and retries pending pushes on its next run.
+
+On the watcher host, the data checkout and publishing command are:
+
+```sh
+git clone --branch archive-data --single-branch https://github.com/stutxo/slipstreambot.git state/public-archive
+.venv/bin/python explorer-site/publish_data.py --config config.toml --checkout state/public-archive
+```
+
+These commands use the existing public data branch and require Git write access for updates. The user units under `explorer-site/systemd/` assume the project is installed at `~/slipstreambot`. The publish timer checks for changes every five minutes. The refresh timer reconciles the pool index and analyzes newly verified entries daily. GitHub’s cache can add a few minutes before an update appears.
+
+```sh
+systemctl --user link "$PWD"/explorer-site/systemd/slipstreambot-archive-{publish,refresh}.{service,timer}
+systemctl --user daemon-reload
+systemctl --user enable --now slipstreambot-archive-{publish,refresh}.timer
+```
+
 
 ## Inspect a block
 

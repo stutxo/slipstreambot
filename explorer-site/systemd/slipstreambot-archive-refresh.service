@@ -1,0 +1,9 @@
+[Unit]
+Description=Reconcile the historical MARA pool index with Bitcoin Core
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/slipstreambot
+ExecStart=%h/slipstreambot/.venv/bin/python -m slipstreambot.archive_index --config config.toml
+ExecStart=%h/slipstreambot/.venv/bin/python -m slipstreambot.archive_analyze --config config.toml
+Nice=10
