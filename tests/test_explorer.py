@@ -39,7 +39,10 @@ class ExplorerTests(unittest.TestCase):
         self.assertEqual([b["height"] for b in payload["blocks"]], list(range(56, 6, -1)))
         self.assertEqual(payload["blocks"][0], {
             "height": 56, "hash": "hash56", "time": 1234, "transactions": 13,
+            "mempool_summary": "Local mempool coverage before block connection is unknown.",
+            "mempool_not_observed": None,
             "findings": [{"txid": "abc", "reasons": ["First reason", "Second reason"],
+                          "mempool_observation": "Local mempool observation unknown.",
                           "slipstream_assessment": "Fit with published Slipstream rules is unknown."}],
         })
         with self.db:
@@ -50,6 +53,34 @@ class ExplorerTests(unittest.TestCase):
         self.assertEqual(updated["height"], 55)
         self.assertEqual(updated["blocks"][0]["height"], 55)
         self.assertEqual(updated["blocks"][0]["findings"], [])
+
+    def test_mempool_misses_and_policy_findings_share_one_row_per_transaction(self):
+        report = {
+            "pool": "MARA", "time": 2000, "transactions_examined": 3,
+            "findings": [{"txid": txid, "violations": [{"detail": "Weight limit"}]}
+                         for txid in ["both", "policy"]],
+            "mempool": {"status": "covered", "since": 1200, "seen": 1,
+                        "not_observed": ["both", "missing"]},
+        }
+        with self.db:
+            self.db.execute("INSERT INTO blocks VALUES (5, 'hash5', ?)", (json.dumps(report),))
+            self.db.execute("UPDATE chain_state SET height=5")
+        block = read_blocks(self.path)["blocks"][0]
+        self.assertEqual(block["mempool_not_observed"], 2)
+        self.assertIn("1 seen, 2 not observed", block["mempool_summary"])
+        self.assertIn("1970-01-01 00:20:00 UTC", block["mempool_summary"])
+        both, policy, missing = block["findings"]
+        self.assertEqual([both["txid"], policy["txid"], missing["txid"]], ["both", "policy", "missing"])
+        self.assertEqual(both["reasons"], ["Weight limit"])
+        self.assertIn("Not observed", both["mempool_observation"])
+        self.assertIn("Seen in this node", policy["mempool_observation"])
+        self.assertEqual(missing["mempool_observation"], both["mempool_observation"])
+        self.assertEqual(missing["reasons"], [])
+        self.assertIsNone(missing["slipstream_assessment"])
+        report["mempool"].update(seen=3, not_observed=[])
+        with self.db:
+            self.db.execute("UPDATE blocks SET report=? WHERE height=5", (json.dumps(report),))
+        self.assertEqual(read_blocks(self.path)["blocks"][0]["mempool_not_observed"], 0)
 
     def test_assessments_only_describe_observed_exceptions(self):
         combinations = [

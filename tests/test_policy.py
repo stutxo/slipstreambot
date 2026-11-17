@@ -46,6 +46,27 @@ class PolicyTests(unittest.TestCase):
                 self.assertEqual(report["findings"], [])
                 self.assertIsNotNone(notice)
                 self.assertEqual(notice.event_id, f"block:{block['hash']}")
+                self.assertIn("coverage before block connection is unknown", notice.body)
+
+    def test_notifications_include_local_mempool_evidence_and_policy_reasons(self):
+        report = {
+            "pool": "MARA", "time": 2500, "height": 12, "hash": "hash", "transactions_examined": 3,
+            "findings": [{"txid": txid, "violations": [{"detail": "Weight limit"}]}
+                         for txid in ["both-tx", "seen-tx"]],
+            "mempool": {"status": "covered", "since": 1800, "seen": 1,
+                        "not_observed": ["both-tx", "missing-tx"]},
+        }
+        body = block_notification(report).body
+        self.assertIn("1 seen, 2 not observed", body)
+        self.assertIn("1970-01-01 00:30:00 UTC", body)
+        self.assertEqual(body.count("both-tx"), 1)
+        self.assertIn("both-tx\nReason: Weight limit\nNot observed in this node", body)
+        self.assertIn("seen-tx\nReason: Weight limit\nSeen in this node", body)
+        self.assertIn("missing-tx\nReason: Not observed in this node", body)
+        report["mempool"]["status"] = "unknown"
+        unknown = block_notification(report).body
+        self.assertIn("Local mempool observation unknown.", unknown)
+        self.assertNotIn("missing-tx", unknown)
 
     def test_current_op_return_rules_do_not_use_old_83_byte_limit(self):
         tx = transaction()

@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from .config import ConfigError, load_config, rpc_options
 from .explorer import serve_explorer
-from .monitor import Monitor
+from .monitor import Monitor, saved_mempool_evidence
 from .notifications import Notification, NotificationError, build_backends, notify_many
 from .policy import analyze_block, block_notification
 from .rpc import BitcoinRPC, RPCError
@@ -67,6 +67,8 @@ def main(argv: list[str] | None = None) -> int:
             if block.get("confirmations", 0) < 1:
                 raise ConfigError("Block is not on the active chain")
             report = analyze(block)
+            if report["pool"] == "MARA":
+                report["mempool"] = saved_mempool_evidence(options["state_path"], block_hash)
             print(json.dumps(report, indent=2))
             if args.notify and (notification := block_notification(report)):
                 failures = notify_many(notification, build_backends(config["notifiers"]))
@@ -76,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         monitor = Monitor(
             rpc, zmq_endpoint=config["bitcoin"]["zmq_endpoint"], state_path=options["state_path"],
+            zmq_sequence_endpoint=config["bitcoin"].get("zmq_sequence_endpoint"),
             analyze=analyze, notification=block_notification, backends=build_backends(config["notifiers"]),
             poll_seconds=options["poll_seconds"], start_height=options.get("start_height"),
         )

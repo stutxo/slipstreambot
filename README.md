@@ -2,7 +2,7 @@
 
 Small Python app that watches Bitcoin Core's `hashblock` ZMQ feed, identifies MARA coinbase tags, and sends a notification for every MARA-attributed block. Blocks attributed to other pools do not trigger notifications.
 
-Alerts contain the block height, hash, UTC timestamp, and total transaction count (including coinbase). Each flagged transaction has two fields: `Possible Slipstream tx: <txid>` and `Reason: <policy exception details>`. Multiple reasons are separated by semicolons. Blocks with no findings say `No policy exceptions detected.`
+Alerts include the block height, hash, UTC timestamp and total transaction count (including coinbase). A transaction is highlighted if it has a detected policy exception or the watcher had mempool coverage and did not observe it before this node connected the block. A transaction that meets both conditions appears once with both observations.
 
 Full policy comparisons against pinned Libre Relay rules and MARA's published Slipstream exceptions remain in the SQLite reports and `scan` JSON output, rather than cluttering notifications.
 
@@ -36,7 +36,15 @@ No `txindex` is required: RPC verbosity 3 supplies spent prevouts from undo data
 
 First run analyzes the current tip, then new blocks. Set `[monitor].start_height` for inclusive backfill. Existing state always resumes its stored cursor; use a different `state_path` for an independent backfill. Reports (including all findings) and delivery state are stored in SQLite. One watcher may use each state database.
 
-ZMQ is a wakeup, not the chain authority: the watcher reconciles RPC on every notification and every `poll_seconds` (30 by default), recovering missed messages and downtime. Reorgs retract previously delivered alerts, cancel unsent orphan alerts, and scan the replacement branch. Reorg replay does not extend before the original monitoring start height. Delivery is **at least once**: crashes after HTTP success or a partially delivered multi-part message may produce duplicates. A failed destination is retried without stopping other destinations or block processing. Disabled/removed destination names retain pending deliveries until re-enabled; keep names stable and use a new name when changing recipients. State retains reports/outbox history and grows over time.
+### Observe the local mempool
+
+To enable this signal, set `zmqpubsequence=tcp://127.0.0.1:28333` in Bitcoin Core and set `zmq_sequence_endpoint = "tcp://127.0.0.1:28333"` under `[bitcoin]` in the bot's config. Use the address of this same node's `pubsequence` publisher if it already has one. Core reads new publisher settings at startup.
+
+After subscribing, the watcher waits for a block connection on a synced, transaction-relaying node with a loaded mempool. It takes a mempool snapshot at that tip and records subsequent admissions, including transactions later evicted or replaced. For each covered MARA block it compares all non-coinbase transaction IDs with the IDs observed up to that block's connection event. Reports include the start time of the observation window. Ordinary propagation delays and differences in local relay policy can also explain a missing transaction.
+
+The first block after startup or a coverage reset is a reference point and has unknown coverage. Historical blocks, missed boundaries, and blocks across a disconnect or reorganization also show unknown coverage. The watcher keeps up to 500,000 distinct transaction IDs per window and the three most recent block boundaries in memory. When the ID limit is exceeded it starts a fresh window at a later block. The comparison for each analyzed MARA block is saved in SQLite with its report. A later `scan` reuses that evidence only for the same block hash.
+
+The watcher checks the active chain over RPC after block notifications and every `poll_seconds` (30 by default), recovering missed blocks after downtime. Mempool admissions update local observation history without triggering a chain scan. Reorgs retract previously delivered alerts, cancel unsent orphan alerts, and scan the replacement branch. Reorg replay does not extend before the original monitoring start height. Delivery is **at least once**: crashes after HTTP success or a partially delivered multi-part message may produce duplicates. A failed destination is retried without stopping other destinations or block processing. Disabled/removed destination names retain pending deliveries until re-enabled; keep names stable and use a new name when changing recipients. State retains reports/outbox history and grows over time.
 
 Run in the foreground under your process supervisor if you want automatic restart. SIGTERM and Ctrl-C stop cleanly. Log output records processed heights, attribution, and finding counts.
 
@@ -48,7 +56,7 @@ With the watcher running, start the explorer in a second terminal and open [the 
 uv run slipstreambot --config config.toml explore
 ```
 
-The page reads the watcher's SQLite reports every 30 seconds and shows up to 50 recent MARA blocks, newest first. Expand a block to see its hash and the policy exceptions for each highlighted transaction. Each finding shows whether those exceptions fit MARA's published rules, exceed a published rule, or have unknown coverage. Select **Flagged only** to show blocks with findings. On mainnet, block hashes and transaction IDs link to mempool.space.
+The page reads the watcher's SQLite reports every 30 seconds and shows up to 50 recent MARA blocks, newest first. Expand a block to see its local mempool coverage and the evidence for each highlighted transaction. Policy findings also show how the exceptions compare with MARA's published rules. Select **Flagged blocks** to show blocks with either signal, or **Mempool misses** to show covered blocks containing a transaction the node did not observe. On mainnet, block hashes and transaction IDs link to mempool.space.
 
 The server binds to loopback and reads the configured state database even when the watcher is offline. The footer shows the last scanned height. Use `explore --port 8081` to select another port.
 
