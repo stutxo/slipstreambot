@@ -40,6 +40,20 @@ ZMQ is a wakeup, not the chain authority: the watcher reconciles RPC on every no
 
 Run in the foreground under your process supervisor if you want automatic restart. SIGTERM and Ctrl-C stop cleanly. Log output records processed heights, attribution, and finding counts.
 
+## Block explorer
+
+With the watcher running, start the explorer in a second terminal and open [the local explorer](http://127.0.0.1:8080/).
+
+```sh
+uv run slipstreambot --config config.toml explore
+```
+
+The page reads the watcher's SQLite reports every 30 seconds and shows up to 50 recent MARA blocks, newest first. Expand a block to see its hash and the policy exceptions for each highlighted transaction. Each finding shows whether those exceptions fit MARA's published rules, exceed a published rule, or have unknown coverage. Select **Flagged only** to show blocks with findings. On mainnet, block hashes and transaction IDs link to mempool.space.
+
+The server binds to loopback and reads the configured state database even when the watcher is offline. The footer shows the last scanned height. Use `explore --port 8081` to select another port.
+
+For static hosting, run `uv run python explorer-site/build.py --config config.toml` and serve `explorer-site/dist/`. The snapshot records its export time in UTC.
+
 ## Inspect a block
 
 ```sh
@@ -111,13 +125,14 @@ Current Core does **not** have the old default 83-byte/single-OP_RETURN restrict
 - Output templates, aggregate OP_RETURN script bytes, bare multisig key counts.
 - scriptSig size, push-only status, and non-minimal pushes in push-only scriptSigs.
 - Dust count and nonzero-fee dust, allowing uncertainty for single ephemeral-dust outputs.
-- With prevouts: unknown input templates, P2SH sigops, transaction sigop cost, BIP54 legacy sigops, P2WSH script/stack limits, Taproot annex rules and argument sizes, unknown witness/leaf versions, P2A witness stuffing.
+- With prevouts: unknown input templates, P2SH sigops, transaction sigop cost, BIP54 legacy sigops, P2WSH script/stack limits, Taproot annex rules and argument sizes, unknown witness/leaf versions, native P2A witness stuffing, and unsupported P2SH-wrapped P2A spends.
+- In a revealed tapscript leaf, a decoded `OP_SUCCESSx` opcode triggers a finding even inside a skipped branch. Bytes inside data pushes, the control block, and the annex are excluded from this scan.
 - TRUC absolute sigop-adjusted size. Same-block parents are context, **not** proof of historical unconfirmed-child/package eligibility; Slipstream only documents the parent exception.
 - Legacy `OP_CODESEPARATOR` (including in unexecuted branches) and provable CLEANSTACK failures for known templates/simple straight-line stack operations.
 
 ### Deliberately unknown
 
-Full script execution, general CLEANSTACK, signature encoding/low-S/NULLFAIL, execution-dependent minimal-data/NOP/OP_SUCCESS checks, and CONST_SCRIPTCODE's `FindAndDelete` case are not fully evaluated. Witness clean-stack requirements are consensus rules, not exceptions Slipstream can disable. Historical mempool fee deltas, package/cluster topology, conflicts and relay arrival order are unavailable from a block. A single zero-fee dust output is not automatically nonstandard. Node-specific defaults and unpublished Slipstream rules remain unknown.
+Full script execution, general CLEANSTACK, signature encoding/low-S/NULLFAIL, execution-dependent minimal-data/NOP checks, and CONST_SCRIPTCODE's `FindAndDelete` case are not fully evaluated. Witness clean-stack requirements are consensus rules, not exceptions Slipstream can disable. Historical mempool fee deltas, package/cluster topology, conflicts and relay arrival order are unavailable from a block. A single zero-fee dust output is not automatically nonstandard. Node-specific defaults and unpublished Slipstream rules remain unknown.
 
 Per-rule results mean `reject`, `within_pinned_rule`, `within_published_rule`, or `unknown`—never an assertion that a whole transaction would be accepted. A transaction outside Libre's pinned policy might have reached a miner through Slipstream **or another private/custom path**. Running `testmempoolaccept` on already-mined transactions would not answer this: their inputs have been spent.
 
