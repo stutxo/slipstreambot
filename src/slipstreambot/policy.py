@@ -12,6 +12,8 @@ MARA_TAGS = (
     "MARA Pool", "MARA Made in USA", "mara_pool_sv2", "mara-pool-sv2",
     "mara_jdc_sv2", "Sv2/MARA",
 )
+# MARA's public launch announcement on 2024-02-22 at 15:12 EST.
+SLIPSTREAM_ANNOUNCEMENT = 1708632720
 PROFILES = {
     "core": "Bitcoin Core v32.1 defaults",
     "libre": "Libre Relay v31.2 (8f182a3c013da07f33102aefed06180862c83102)",
@@ -236,20 +238,26 @@ def analyze_transaction(tx: dict) -> tuple[dict | None, list[str]]:
     }, gaps
 
 
-def analyze_block(block: dict, *, mara_tags: tuple[str, ...] | None = None) -> dict:
+def analyze_block(block: dict, *, mara_tags: tuple[str, ...] | None = None,
+                  verified_pool_evidence: tuple[str, ...] | None = None) -> dict:
     tags = MARA_TAGS if mara_tags is None else mara_tags
     coinbase = bytes.fromhex(block["tx"][0]["vin"][0]["coinbase"])
-    evidence = [tag for tag in tags if tag.encode("utf-8") in coinbase]
+    evidence = (list(verified_pool_evidence) if verified_pool_evidence is not None else
+                [tag for tag in tags if tag.encode("utf-8") in coinbase])
+    pre_slipstream = block["time"] < SLIPSTREAM_ANNOUNCEMENT
     report = {
         "height": block["height"], "hash": block["hash"],
         "previousblockhash": block.get("previousblockhash"), "time": block["time"],
-        "pool": "MARA" if evidence else None, "pool_evidence": evidence,
+        "pool": "MARA" if evidence else None, "pool_evidence": evidence, "pre_slipstream": pre_slipstream,
         "profiles": dict(PROFILES), "findings": [], "coverage": list(COVERAGE),
         "transactions_examined": 0,
     }
     if not evidence:
         report["coverage"].append("Not attributed to MARA; transactions were not analyzed.")
         return report
+    if pre_slipstream:
+        report["profiles"].pop("slipstream")
+        report["coverage"].append("Block predates the public Slipstream launch; policy comparisons are retrospective.")
     incomplete = 0
     block_txids = {tx["txid"] for tx in block["tx"][1:]}
     for tx in block["tx"][1:]:
@@ -264,6 +272,10 @@ def analyze_block(block: dict, *, mara_tags: tuple[str, ...] | None = None) -> d
         report["transactions_examined"] += 1
         incomplete += bool(gaps)
         if finding:
+            if pre_slipstream:
+                finding.pop("route_assessment")
+                for violation in finding["violations"]:
+                    violation.pop("slipstream")
             report["findings"].append(finding)
     if incomplete:
         report["coverage"].append(f"{incomplete} transactions have additional input/package coverage gaps.")
@@ -294,13 +306,14 @@ def block_signals(report: dict) -> tuple[str, list[dict]]:
         if txid in policy:
             violations = policy[txid].get("violations", [])
             reasons = [violation["detail"] for violation in violations]
-            comparisons = {violation.get("slipstream") for violation in violations}
-            if "reject" in comparisons:
-                assessment = "An observed exception falls outside a published Slipstream rule."
-            elif comparisons == {"within_published_rule"}:
-                assessment = "The observed exceptions fit published Slipstream rules."
-            else:
-                assessment = "Fit with published Slipstream rules is unknown."
+            if not report.get("pre_slipstream"):
+                comparisons = {violation.get("slipstream") for violation in violations}
+                if "reject" in comparisons:
+                    assessment = "An observed exception falls outside a published Slipstream rule."
+                elif comparisons == {"within_published_rule"}:
+                    assessment = "The observed exceptions fit published Slipstream rules."
+                else:
+                    assessment = "Fit with published Slipstream rules is unknown."
         if txid in absent:
             presence = "Not observed in this node's mempool before block connection."
         elif covered:
@@ -329,7 +342,8 @@ def block_notification(report: dict):
         reason = finding["mempool_observation"]
         if finding["reasons"]:
             reason = "; ".join(finding["reasons"]) + "\n" + reason
-        sections.append(f"Possible Slipstream tx: {finding['txid']}\nReason: {reason}")
+        label = "Policy exception tx" if report.get("pre_slipstream") else "Possible Slipstream tx"
+        sections.append(f"{label}: {finding['txid']}\nReason: {reason}")
     if not findings:
         sections.append("No policy exceptions detected.")
     return Notification(

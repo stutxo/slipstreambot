@@ -15,7 +15,9 @@ p { margin: .65rem 0 0; }
 .toolbar, footer { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: .6rem; }
 .toolbar { margin: 2rem 0 1.2rem; }
 h2 { margin: 0; font-size: 1.25rem; }
-select { font: inherit; color: inherit; }
+select, button { font: inherit; color: inherit; }
+button:disabled { color: #747870; }
+nav { margin-top: 1rem; }
 .row { display: grid; grid-template-columns: 1.1fr 1.6fr 1fr 1fr 1rem; align-items: baseline; gap: .5rem; }
 .labels { padding-bottom: .5rem; border-bottom: 1px solid #c8cdc1; }
 details { border-bottom: 1px solid #d6dacf; font-variant-numeric: tabular-nums; }
@@ -42,11 +44,11 @@ footer { padding: 1.2rem 0; }
 <body>
 <header>
   <h1>MARA block explorer</h1>
-  <p>MARA-tagged Bitcoin blocks. Possible Slipstream signals include policy exceptions and transactions missing from this node’s mempool observations.</p>
+  <p>MARA-attributed Bitcoin blocks, policy exceptions, and transactions missing from this node’s mempool observations.</p>
 </header>
 <main>
   <div class="toolbar">
-    <h2>Recent blocks</h2>
+    <div><h2>Block archive</h2><span id="counts" class="meta"></span></div>
     <select id="filter" aria-label="Filter blocks">
       <option value="all">All blocks</option>
       <option value="flagged">Flagged blocks</option>
@@ -57,7 +59,8 @@ footer { padding: 1.2rem 0; }
     <span>Height</span><span>Mined (UTC)</span><span class="tx-count">Transactions</span><span>Flagged</span>
   </div>
   <div id="blocks"></div>
-  <p id="message" role="status">Loading block reports…</p>
+  <p id="message" role="status">Loading block index…</p>
+  <nav id="pager" aria-label="Block pages" hidden><button id="newer">Newer</button> <span id="page" class="meta"></span> <button id="older">Older</button></nav>
 </main>
 <footer><span id="cursor"></span><span id="source"></span></footer>
 <noscript>Enable JavaScript to view the block reports.</noscript>
@@ -67,14 +70,25 @@ const number = new Intl.NumberFormat('en-US');
 const date = new Intl.DateTimeFormat('en-GB', {
   timeZone: 'UTC', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false
 });
-let feed;
-const opened = new Set();
+const pageSize = 50;
+const localBase = new URL('.', location.href);
+let feed, dataBase = localBase, preferredBase = localBase, external = false, bundled = false, page = 0;
+let selected = new URL(location.href).searchParams.get('block');
+let scrollToSelection = Boolean(selected);
+const expanded = new Set(selected ? [selected] : []);
+const buckets = new Map();
 
 function element(tag, text, className) {
   const node = document.createElement(tag);
   if (text !== undefined) node.textContent = text;
   if (className) node.className = className;
   return node;
+}
+
+async function fetchJSON(path, cache = 'no-cache', base = dataBase) {
+  const response = await fetch(new URL(path, base), {cache, signal: AbortSignal.timeout(30000)});
+  if (!response.ok) throw new Error('Feed unavailable');
+  return response.json();
 }
 
 function hashLink(kind, hash) {
@@ -86,16 +100,64 @@ function hashLink(kind, hash) {
   return link;
 }
 
-function blockRow(block) {
-  const count = block.findings.length;
-  const row = element('details');
-  row.open = opened.has(block.hash);
-  row.addEventListener('toggle', () => {
-    if (row.isConnected) {
-      if (row.open) opened.add(block.hash);
-      else opened.delete(block.hash);
+function showDetail(panel, block) {
+  const permalink = element('a', 'Permalink');
+  const url = new URL(location.href);
+  url.searchParams.set('block', block.hash);
+  permalink.href = url;
+  panel.replaceChildren(element('div', number.format(block.transactions) + ' transactions · Block hash', 'meta'),
+    hashLink('block', block.hash), document.createTextNode(' · '), permalink);
+  if (block.evidence?.length) panel.append(element('div', 'MARA attribution · ' + block.evidence.join(', '), 'meta'));
+  panel.append(element('p', block.mempool_summary, 'meta'));
+  if (!block.analyzed) {
+    panel.append(element('p', 'Policy analysis pending.'));
+  } else if (block.findings.length) {
+    panel.append(element('p', block.pre_slipstream ? 'Policy exceptions · Before Slipstream’s announcement' : 'Possible Slipstream transactions'));
+    if (block.findings.some(finding => finding.reasons.length))
+      panel.append(element('div', 'Policy comparisons use Bitcoin Core v32.1 defaults.', 'meta'));
+    const list = element('ul');
+    for (const finding of block.findings) {
+      const item = element('li');
+      item.append(hashLink('tx', finding.txid));
+      item.append(element('div', finding.mempool_observation, 'reason'));
+      for (const reason of finding.reasons) item.append(element('div', reason, 'reason'));
+      if (!block.pre_slipstream && finding.slipstream_assessment)
+        item.append(element('div', finding.slipstream_assessment, 'meta'));
+      list.append(item);
     }
-  });
+    panel.append(list);
+  } else {
+    panel.append(element('p', 'No policy exceptions detected against Bitcoin Core v32.1 defaults.', 'meta'));
+  }
+}
+
+async function hydrate(panel, block) {
+  const path = 'details/' + Math.floor(block.height / 1000) + '.json';
+  panel.textContent = 'Loading block details…';
+  try {
+    if (!buckets.has(path)) buckets.set(path, fetchJSON(path));
+    let result = await buckets.get(path);
+    let detail = result.blocks.find(item => item.hash === block.hash && item.height === block.height);
+    if (!detail || detail.analyzed !== (block.flagged !== null) || detail.findings.length !== (block.flagged || 0)) {
+      buckets.set(path, fetchJSON(path + '?refresh=' + Date.now(), 'no-store'));
+      result = await buckets.get(path);
+      detail = result.blocks.find(item => item.hash === block.hash && item.height === block.height);
+    }
+    if (!detail || detail.analyzed !== (block.flagged !== null) || detail.findings.length !== (block.flagged || 0))
+      throw new Error('Detail mismatch');
+    showDetail(panel, detail);
+    if (scrollToSelection && selected === block.hash && panel.isConnected) {
+      panel.parentElement.scrollIntoView({block: 'start'});
+      scrollToSelection = false;
+    }
+  } catch {
+    buckets.delete(path);
+    panel.textContent = 'Block details are unavailable. Close and reopen to retry.';
+  }
+}
+
+function blockRow(block) {
+  const row = element('details');
   const summary = element('summary', undefined, 'row');
   const height = element('strong', number.format(block.height), 'number');
   height.setAttribute('aria-label', 'Block ' + block.height);
@@ -105,73 +167,110 @@ function blockRow(block) {
   const total = element('span', number.format(block.transactions), 'tx-count number');
   total.setAttribute('aria-label', block.transactions + ' transactions');
   const flagged = element('span');
-  flagged.append(element(count ? 'mark' : 'span', String(count), 'number'));
-  flagged.setAttribute('aria-label', count + ' flagged transactions');
+  flagged.append(element(block.flagged ? 'mark' : 'span', block.flagged === null ? 'Pending' : number.format(block.flagged), 'number'));
+  flagged.setAttribute('aria-label', block.flagged === null ? 'Policy analysis pending' : block.flagged + ' flagged transactions');
   summary.append(height, mined, total, flagged);
   const panel = element('div', undefined, 'panel');
-  panel.append(element('div', number.format(block.transactions) + ' transactions · Block hash', 'meta'), hashLink('block', block.hash));
-  panel.append(element('p', block.mempool_summary || 'Local mempool coverage before block connection is unknown.', 'meta'));
-  if (count) {
-    panel.append(element('p', 'Possible Slipstream transactions'));
-    const list = element('ul');
-    for (const finding of block.findings) {
-      const item = element('li');
-      item.append(hashLink('tx', finding.txid));
-      item.append(element('div', finding.mempool_observation || 'Local mempool observation unknown.', 'reason'));
-      for (const reason of finding.reasons) item.append(element('div', reason, 'reason'));
-      if (finding.slipstream_assessment) item.append(element('div', finding.slipstream_assessment, 'meta'));
-      list.append(item);
-    }
-    panel.append(list);
-  } else {
-    panel.append(element('p', 'No policy exceptions detected.', 'meta'));
-  }
   row.append(summary, panel);
+  row.open = expanded.has(block.hash);
+  row.addEventListener('toggle', () => {
+    if (!row.isConnected) return;
+    if (row.open) {
+      expanded.add(block.hash);
+      hydrate(panel, block);
+    } else expanded.delete(block.hash);
+  });
   return row;
 }
 
 function render() {
   const filter = byId('filter').value;
-  let blocks = feed.blocks;
-  let empty = 'No MARA blocks recorded yet.';
+  let blocks = feed.blocks, empty = 'No MARA blocks indexed yet.';
   if (filter === 'flagged') {
-    blocks = blocks.filter(block => block.findings.length);
-    if (feed.blocks.length) empty = 'No flagged transactions in these MARA blocks.';
+    blocks = blocks.filter(block => block.flagged > 0);
+    if (feed.blocks.length) empty = 'No flagged transactions in the analyzed MARA blocks.';
   } else if (filter === 'misses') {
     blocks = blocks.filter(block => block.mempool_not_observed > 0);
     empty = feed.blocks.some(block => Number.isInteger(block.mempool_not_observed))
       ? 'No mempool misses in the MARA blocks with observation coverage.'
       : 'No MARA blocks with local mempool coverage yet.';
   }
-  byId('blocks').replaceChildren(...blocks.map(blockRow));
-  if (!byId('message').dataset.failed) byId('message').textContent = blocks.length ? '' : empty;
-  byId('cursor').textContent = feed.height == null ? 'Awaiting first block' : 'Scanned through block ' + number.format(feed.height);
-  byId('source').textContent = feed.snapshot ? 'Snapshot · ' + date.format(new Date(feed.snapshot)) + ' UTC' : 'Refreshes every 30 seconds';
+  const pages = Math.ceil(blocks.length / pageSize);
+  page = Math.min(page, Math.max(0, pages - 1));
+  if (selected) {
+    const index = blocks.findIndex(block => block.hash === selected);
+    if (index >= 0) page = Math.floor(index / pageSize);
+    else empty = 'This block is unavailable in the current index.';
+  }
+  byId('blocks').replaceChildren(...blocks.slice(page * pageSize, (page + 1) * pageSize).map(blockRow));
+  if (!byId('message').dataset.failed)
+    byId('message').textContent = blocks.length && (!selected || blocks.some(b => b.hash === selected)) ? '' : empty;
+  byId('pager').hidden = pages < 2;
+  byId('newer').disabled = page === 0;
+  byId('older').disabled = page + 1 >= pages;
+  byId('page').textContent = 'Page ' + number.format(page + 1) + ' of ' + number.format(pages);
+  const analyzed = feed.blocks.filter(block => block.flagged !== null).length;
+  byId('counts').textContent = number.format(feed.blocks.length) + ' indexed · ' + number.format(analyzed) +
+    ' analyzed · ' + number.format(feed.blocks.length - analyzed) + ' pending';
+  byId('cursor').textContent = feed.height == null ? '' : 'Watcher through block ' + number.format(feed.height);
+  const source = bundled ? 'Bundled snapshot · Live feed unavailable · ' : 'Updated ';
+  byId('source').textContent = feed.snapshot ? source + date.format(new Date(feed.snapshot)) + ' UTC' : 'Refreshes every 30 seconds';
+}
+
+function leavePermalink() {
+  selected = null;
+  const url = new URL(location.href);
+  url.searchParams.delete('block');
+  history.replaceState(null, '', url);
+}
+byId('filter').addEventListener('change', () => { leavePermalink(); page = 0; if (feed) render(); });
+for (const [id, direction] of [['newer', -1], ['older', 1]]) {
+  byId(id).onclick = () => { leavePermalink(); page += direction; render(); };
 }
 
 async function update() {
   try {
-    const response = await fetch('blocks.json', { cache: 'no-store' });
-    if (!response.ok) throw new Error();
-    const next = await response.json();
-    if (!feed) {
-      const firstFlagged = next.blocks.find(block => block.findings.length);
-      if (firstFlagged) opened.add(firstFlagged.hash);
+    let base = preferredBase, next;
+    try {
+      next = await fetchJSON('archive.json', 'no-cache', base);
+    } catch (error) {
+      if (feed || !external) throw error;
+      base = localBase;
+      next = await fetchJSON('archive.json', 'no-cache', base);
     }
-    if (JSON.stringify(next) !== JSON.stringify(feed) || byId('message').dataset.failed) {
+    if (base.href !== dataBase.href || JSON.stringify(next) !== JSON.stringify(feed) || byId('message').dataset.failed) {
+      buckets.clear();
+      dataBase = base;
+      bundled = external && base === localBase;
       feed = next;
       delete byId('message').dataset.failed;
       render();
     }
   } catch {
     byId('message').dataset.failed = '1';
-    byId('message').textContent = feed ? 'Refresh failed. Showing the last loaded reports.' : 'Block reports are unavailable. Retrying in 30 seconds.';
+    byId('message').textContent = feed ? 'Refresh failed. Showing the last loaded index.' : 'Block index unavailable. Retrying shortly.';
   }
-  if (!feed?.snapshot) setTimeout(update, 30000);
+  if (external || !feed?.snapshot) setTimeout(update, external ? 60000 : 30000);
 }
 
-byId('filter').addEventListener('change', () => { if (feed) render(); });
-update();
+async function start() {
+  try {
+    const response = await fetch(new URL('feed-config.json', location.href), {cache: 'no-cache'});
+    if (response.ok) {
+      const config = await response.json();
+      if (config.data_base) {
+        preferredBase = new URL(config.data_base.replace(/\/+$/, '') + '/');
+        external = true;
+      }
+    } else if (response.status !== 404) throw new Error();
+  } catch {
+    byId('message').textContent = 'Feed configuration unavailable. Retrying shortly.';
+    setTimeout(start, 30000);
+    return;
+  }
+  update();
+}
+start();
 </script>
 </body>
 </html>

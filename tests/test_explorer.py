@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from slipstreambot.cli import main
-from slipstreambot.explorer import read_blocks
+from slipstreambot.explorer import MAINNET_GENESIS, archive_index, archive_reader, detail_bucket, read_blocks
 
 
 class ExplorerTests(unittest.TestCase):
@@ -39,11 +39,12 @@ class ExplorerTests(unittest.TestCase):
         self.assertEqual([b["height"] for b in payload["blocks"]], list(range(56, 6, -1)))
         self.assertEqual(payload["blocks"][0], {
             "height": 56, "hash": "hash56", "time": 1234, "transactions": 13,
+            "analyzed": True, "evidence": [], "pre_slipstream": True,
             "mempool_summary": "Local mempool coverage before block connection is unknown.",
             "mempool_not_observed": None,
             "findings": [{"txid": "abc", "reasons": ["First reason", "Second reason"],
                           "mempool_observation": "Local mempool observation unknown.",
-                          "slipstream_assessment": "Fit with published Slipstream rules is unknown."}],
+                          "slipstream_assessment": None}],
         })
         with self.db:
             self.db.execute("DELETE FROM blocks WHERE height > 55")
@@ -93,7 +94,7 @@ class ExplorerTests(unittest.TestCase):
             {"txid": str(i), "violations": [{"detail": "Example", "slipstream": value} for value in values]}
             for i, values in enumerate(combinations)
         ]
-        report = {"pool": "MARA", "time": 1234, "transactions_examined": 4, "findings": findings}
+        report = {"pool": "MARA", "time": 1800000000, "transactions_examined": 4, "findings": findings}
         with self.db:
             self.db.execute("INSERT INTO blocks VALUES (5, 'hash5', ?)", (json.dumps(report),))
             self.db.execute("UPDATE chain_state SET height=5")
@@ -104,6 +105,43 @@ class ExplorerTests(unittest.TestCase):
             "An observed exception falls outside a published Slipstream rule.",
             "Fit with published Slipstream rules is unknown.",
         ])
+
+    def test_archive_merge_preserves_live_observations_and_active_chain(self):
+        archive = sqlite3.connect(self.path.with_name("archive.sqlite3"))
+        self.addCleanup(archive.close)
+        archive.execute("CREATE TABLE archive_blocks(height INTEGER PRIMARY KEY, hash TEXT, time INTEGER, "
+                        "tx_count INTEGER, evidence TEXT, report TEXT)")
+        template = {"pool": "MARA", "time": 1800000000, "transactions_examined": 2, "findings": []}
+        with archive:
+            for height, block_hash, raw in [
+                (1, "analyzed", {**template, "time": 100, "findings": [
+                    {"txid": "policy", "violations": [{"detail": "Policy exception"}]}]}),
+                (2, "pending", None), (5, "same", template), (6, "payout", template),
+                (7, "orphan", template), (8, "rolled-back", template),
+            ]:
+                archive.execute("INSERT INTO archive_blocks VALUES(?,?,?,?,?,?)",
+                                (height, block_hash, raw["time"] if raw else 100, 3, '["payout address"]',
+                                 json.dumps(raw) if raw is not None else None))
+        live = {**template, "mempool": {"status": "covered", "seen": 1, "not_observed": ["both"], "since": 8},
+                "findings": [{"txid": "both", "violations": [{"detail": "Example"}]}]}
+        with self.db:
+            self.db.execute("UPDATE chain_state SET height=7,genesis=?", (MAINNET_GENESIS,))
+            for height, block_hash, report in [(5, "same", live), (6, "payout", {**template, "pool": None}),
+                                                (7, "replacement", {**template, "pool": None})]:
+                self.db.execute("INSERT INTO blocks VALUES(?,?,?)", (height, block_hash, json.dumps(report)))
+        with archive_reader(self.path) as (db, meta, archived):
+            index = archive_index(db, meta, archived)["blocks"]
+            details = detail_bucket(db, archived, 0)["blocks"]
+            self.assertEqual(detail_bucket(db, archived, 1)["blocks"], [])
+        self.assertEqual([r["hash"] for r in index], ["payout", "same", "pending", "analyzed"])
+        self.assertEqual([r["flagged"] for r in index], [0, 1, None, 1])
+        self.assertEqual(index[1]["mempool_not_observed"], 1)
+        self.assertNotIn("findings", index[1])
+        self.assertEqual(details[1]["evidence"], ["payout address"])
+        self.assertEqual(details[1]["findings"][0]["txid"], "both")
+        self.assertFalse(details[2]["analyzed"])
+        self.assertIsNone(details[3]["findings"][0]["slipstream_assessment"])
+        self.assertTrue(details[3]["pre_slipstream"])
 
     def test_no_scanned_blocks_and_missing_database(self):
         self.assertEqual(read_blocks(self.path), {"height": None, "mainnet": False, "blocks": []})
