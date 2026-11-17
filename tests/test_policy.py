@@ -114,9 +114,13 @@ class PolicyTests(unittest.TestCase):
         tx["vin"][1]["txinwitness"] = ["11" * 64]
         self.assertEqual(codes(tx)["taproot-annex"]["libre"], "reject")
         del tx["vin"][1]["prevout"]
+        self.assertEqual(codes(tx)["taproot-annex"]["libre"], "reject")
+        tx["vin"][1]["txinwitness"].append("5000")
         finding, _ = analyze_transaction(tx)
         self.assertEqual(codes(tx)["taproot-annex"]["libre"], "unknown")
         self.assertIn("eligibility unknown", finding["route_assessment"])
+        vin["txinwitness"][-1] = "5001"
+        self.assertEqual(codes(tx)["taproot-annex"]["libre"], "reject")
 
     def test_p2wsh_limits_exclude_script_from_argument_size(self):
         tx = transaction()
@@ -125,6 +129,41 @@ class PolicyTests(unittest.TestCase):
         self.assertNotIn("p2wsh-stack-item", codes(tx))
         tx["vin"][0]["txinwitness"][0] += "11"
         self.assertIn("p2wsh-stack-item", codes(tx))
+
+    def test_tapscript_success_opcodes_observe_leaf_and_push_boundaries(self):
+        tx = transaction()
+        vin = tx["vin"][0]
+        vin["prevout"] = output(b"\x51\x20" + b"\x22" * 32)
+        control = "c0" + "22" * 32
+        for script in ("50", "00637e6851", "fe4d"):
+            # A success opcode is recognized even in an inactive branch or before a bad tail.
+            with self.subTest(script=script):
+                vin["txinwitness"] = [script, control]
+                finding = codes(tx)["tapscript-op-success"]
+                self.assertEqual((finding["core"], finding["libre"], finding["slipstream"]),
+                                 ("reject", "reject", "unknown"))
+        vin["txinwitness"] = ["017e7551", control, "50bb"]
+        self.assertNotIn("tapscript-op-success", codes(tx))
+        vin["txinwitness"] = ["50", "c2" + "22" * 32]
+        self.assertNotIn("tapscript-op-success", codes(tx))
+        vin["txinwitness"] = ["50" * 64]
+        self.assertNotIn("tapscript-op-success", codes(tx))
+
+    def test_anchor_policy_distinguishes_native_and_wrapped_spends(self):
+        tx = transaction()
+        anchor = bytes.fromhex("51024e73")
+        vin = tx["vin"][0]
+        vin["prevout"] = output(anchor)
+        vin["txinwitness"] = []
+        self.assertEqual(codes(tx), {})
+        vin["txinwitness"] = ["01"]
+        self.assertIn("anchor-witness", codes(tx))
+        vin["prevout"] = output(b"\xa9\x14" + b"\x22" * 20 + b"\x87")
+        vin["scriptSig"]["hex"] = push(anchor).hex()
+        for witness in ([], ["01"]):
+            with self.subTest(witness=witness):
+                vin["txinwitness"] = witness
+                self.assertEqual(set(codes(tx)), {"unknown-witness-spend"})
 
     def test_single_ephemeral_dust_is_not_always_nonstandard(self):
         tx = transaction()

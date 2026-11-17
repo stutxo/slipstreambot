@@ -1,0 +1,97 @@
+import json
+from pathlib import Path
+import sqlite3
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from slipstreambot.cli import main
+from slipstreambot.explorer import read_blocks
+
+
+class ExplorerTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.path = Path(folder.name) / "state #1.sqlite3"
+        self.db = sqlite3.connect(self.path)
+        self.addCleanup(self.db.close)
+        self.db.executescript("""
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE chain_state (singleton INTEGER, start_height INTEGER, height INTEGER, genesis TEXT);
+            CREATE TABLE blocks (height INTEGER PRIMARY KEY, hash TEXT, report TEXT);
+            INSERT INTO chain_state VALUES (1, 5, 4, 'unknown');
+        """)
+
+    def test_latest_mara_reports_and_committed_reorg(self):
+        findings = [{"txid": "abc", "violations": [{"detail": "First reason"}, {"detail": "Second reason"}]}]
+        with self.db:
+            for height in range(5, 58):
+                report = {
+                    "pool": "MARA" if height < 57 else None, "time": 1234,
+                    "transactions_examined": 12, "findings": findings if height == 56 else [],
+                }
+                self.db.execute("INSERT INTO blocks VALUES (?,?,?)",
+                                (height, f"hash{height}", json.dumps(report)))
+            self.db.execute("UPDATE chain_state SET height=57")
+        payload = read_blocks(self.path)
+        self.assertEqual(payload["height"], 57)
+        self.assertEqual([b["height"] for b in payload["blocks"]], list(range(56, 6, -1)))
+        self.assertEqual(payload["blocks"][0], {
+            "height": 56, "hash": "hash56", "time": 1234, "transactions": 13,
+            "findings": [{"txid": "abc", "reasons": ["First reason", "Second reason"],
+                          "slipstream_assessment": "Fit with published Slipstream rules is unknown."}],
+        })
+        with self.db:
+            self.db.execute("DELETE FROM blocks WHERE height > 55")
+            self.db.execute("UPDATE chain_state SET height=55")
+            self.assertEqual(read_blocks(self.path)["height"], 57)
+        updated = read_blocks(self.path)
+        self.assertEqual(updated["height"], 55)
+        self.assertEqual(updated["blocks"][0]["height"], 55)
+        self.assertEqual(updated["blocks"][0]["findings"], [])
+
+    def test_assessments_only_describe_observed_exceptions(self):
+        combinations = [
+            ["within_published_rule", "within_published_rule"],
+            ["within_published_rule", "unknown"],
+            ["unknown", "reject"],
+            [],
+        ]
+        findings = [
+            {"txid": str(i), "violations": [{"detail": "Example", "slipstream": value} for value in values]}
+            for i, values in enumerate(combinations)
+        ]
+        report = {"pool": "MARA", "time": 1234, "transactions_examined": 4, "findings": findings}
+        with self.db:
+            self.db.execute("INSERT INTO blocks VALUES (5, 'hash5', ?)", (json.dumps(report),))
+            self.db.execute("UPDATE chain_state SET height=5")
+        actual = read_blocks(self.path)["blocks"][0]["findings"]
+        self.assertEqual([f["slipstream_assessment"] for f in actual], [
+            "The observed exceptions fit published Slipstream rules.",
+            "Fit with published Slipstream rules is unknown.",
+            "An observed exception falls outside a published Slipstream rule.",
+            "Fit with published Slipstream rules is unknown.",
+        ])
+
+    def test_no_scanned_blocks_and_missing_database(self):
+        self.assertEqual(read_blocks(self.path), {"height": None, "mainnet": False, "blocks": []})
+        with self.db:
+            self.db.execute("UPDATE chain_state SET genesis=?",
+                            ("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",))
+        self.assertIs(read_blocks(self.path)["mainnet"], True)
+        missing = self.path.with_name("missing.sqlite3")
+        with self.assertRaises(sqlite3.OperationalError):
+            read_blocks(missing)
+        self.assertFalse(missing.exists())
+
+    def test_explore_uses_configured_state_without_rpc_or_notifier_credentials(self):
+        config = self.path.with_name("site.toml")
+        config.write_text(
+            '[bitcoin]\nrpc_user="user"\nrpc_password_env="UNSET_RPC_KEY"\n'
+            '[monitor]\nstate_path="custom.sqlite3"\n'
+            '[[notifiers]]\nkind="telegram"\n'
+        )
+        with patch("slipstreambot.cli.serve_explorer") as serve:
+            self.assertEqual(main(["--config", str(config), "explore", "--port", "8085"]), 0)
+        serve.assert_called_once_with(str(config.parent / "custom.sqlite3"), 8085)

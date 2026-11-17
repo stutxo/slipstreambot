@@ -1,6 +1,13 @@
 """Structural Script helpers, deliberately not a consensus interpreter."""
 
 
+# BIP342 reserves these opcodes in tapscript leaves.
+TAPSCRIPT_SUCCESS_OPCODES = frozenset({
+    80, 98, 126, 127, 128, 129, 131, 132, 133, 134, 137, 138, 141, 142,
+    149, 150, 151, 152, 153, *range(187, 255),
+})
+
+
 def operations(script: bytes):
     position = 0
     while position < len(script):

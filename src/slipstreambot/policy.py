@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from .scripts import (
-    is_push_only, legacy_stack_size, minimal_push, multisig, operations,
+    TAPSCRIPT_SUCCESS_OPCODES, is_push_only, legacy_stack_size, minimal_push, multisig, operations,
     pushed_stack, script_kind, sigops, witness_program,
 )
 
@@ -48,6 +48,10 @@ def _dust_threshold(script: bytes) -> int:
         return 0
     spend_size = 67 if witness_program(script) else 148
     return 3 * (8 + _compact_size(len(script)) + len(script) + spend_size)
+
+
+def _libre_annex_namespace(annex: bytes) -> bool:
+    return annex == b"\x50" or annex.startswith(b"\x50\x00")
 
 
 def _route(violations: list[dict]) -> str:
@@ -111,7 +115,8 @@ def analyze_transaction(tx: dict) -> tuple[dict | None, list[str]]:
     witness_cost = 0
     extra_p2sh_cost = 0
     missing_prevouts = 0
-    annexes: dict[int, bytes] = {}
+    annexes: list[bytes] = []
+    possible_missing_annexes = 0
     for number, vin in enumerate(tx["vin"]):
         script_sig = bytes.fromhex(vin.get("scriptSig", {}).get("hex", ""))
         legacy_cost += sigops(script_sig, accurate=False) * 4
@@ -126,6 +131,11 @@ def analyze_transaction(tx: dict) -> tuple[dict | None, list[str]]:
         prevout = vin.get("prevout")
         if prevout is None:
             missing_prevouts += 1
+            # A missing prevout can hide a native Taproot spend. Its scriptSig
+            # and witness must still have the shape required by the annex rule.
+            witness_items = vin.get("txinwitness", [])
+            if not script_sig and len(witness_items) >= 2 and _libre_annex_namespace(bytes.fromhex(witness_items[-1])):
+                possible_missing_annexes += 1
             continue
         previous_script = _script(prevout)
         kind = script_kind(previous_script)
@@ -177,23 +187,36 @@ def analyze_transaction(tx: dict) -> tuple[dict | None, list[str]]:
                 add("p2wsh-stack-item", f"Input {number}: witness argument exceeds 80 bytes")
         elif version == 1 and len(program_bytes) == 32 and not wrapped:
             if len(witness) >= 2 and witness[-1][:1] == b"\x50":
-                annexes[number] = witness.pop()
+                annexes.append(witness.pop())
             if len(witness) >= 2 and witness[-1]:
                 leaf_version = witness[-1][0] & 0xFE
                 if leaf_version != 0xC0:
                     add("taproot-leaf-version", f"Input {number}: unknown Taproot leaf version {leaf_version:#x}")
-                elif any(len(item) > 80 for item in witness[:-2]):
-                    add("tapscript-stack-item", f"Input {number}: tapscript argument exceeds 80 bytes")
-        elif executed == b"\x51\x02\x4e\x73":
+                else:
+                    if any(len(item) > 80 for item in witness[:-2]):
+                        add("tapscript-stack-item", f"Input {number}: tapscript argument exceeds 80 bytes")
+                    # BIP342 scans for OP_SUCCESSx before evaluating conditionals.
+                    try:
+                        for op, _ in operations(witness[-2]):
+                            if op in TAPSCRIPT_SUCCESS_OPCODES:
+                                add("tapscript-op-success", f"Input {number}: tapscript contains OP_SUCCESS{op}")
+                                break
+                    except ValueError:
+                        gaps.append(f"Input {number}: malformed tapscript push prevents a complete opcode scan.")
+        elif kind == "anchor":
             if witness:
                 add("anchor-witness", f"Input {number}: P2A witness stuffing")
         else:
             add("unknown-witness-spend", f"Input {number}: unsupported witness version/program")
 
     if annexes:
-        libre_annex = len(annexes) == len(tx["vin"]) and all(len(a) == 1 or a[1] == 0 for a in annexes.values())
-        add("taproot-annex", f"Taproot annex in {len(annexes)} of {len(tx['vin'])} inputs",
-            libre="within_pinned_rule" if libre_annex else "unknown" if missing_prevouts else "reject")
+        libre = "reject"
+        if all(_libre_annex_namespace(annex) for annex in annexes):
+            if len(annexes) == len(tx["vin"]):
+                libre = "within_pinned_rule"
+            elif len(annexes) + possible_missing_annexes == len(tx["vin"]):
+                libre = "unknown"
+        add("taproot-annex", f"Taproot annex identified in {len(annexes)} of {len(tx['vin'])} inputs", libre=libre)
     if missing_prevouts:
         gaps.append(f"{missing_prevouts} input prevouts missing: input, witness, sigop and fee checks are incomplete.")
     if bip54_sigops > 2500:

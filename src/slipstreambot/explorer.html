@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>MARA block explorer</title>
+<style>
+:root { color: #242722; background: #f9faf7; font: 16px/1.5 system-ui, sans-serif; }
+body { max-width: 56rem; margin: auto; padding: clamp(1rem, 4vw, 3rem); }
+header { border-bottom: 1px solid #353932; padding: 2rem 0 1.5rem; }
+h1 { margin: 0; font-size: clamp(2rem, 6vw, 3.6rem); letter-spacing: -.055em; line-height: 1.1; }
+p { margin: .65rem 0 0; }
+.meta, footer, .labels, .reason { color: #585e54; font-size: .875rem; }
+.toolbar, footer { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: .6rem; }
+.toolbar { margin: 2rem 0 1.2rem; }
+h2 { margin: 0; font-size: 1.25rem; }
+input { accent-color: #43563d; }
+.row { display: grid; grid-template-columns: 1.1fr 1.6fr 1fr 1fr 1rem; align-items: baseline; gap: .5rem; }
+.labels { padding-bottom: .5rem; border-bottom: 1px solid #c8cdc1; }
+details { border-bottom: 1px solid #d6dacf; font-variant-numeric: tabular-nums; }
+summary { cursor: pointer; list-style: none; padding: .85rem 0; }
+summary::-webkit-details-marker { display: none; }
+summary::after { content: "+"; text-align: center; color: #585e54; }
+details[open] summary::after { content: "−"; }
+summary:hover, a:hover { color: #536c41; }
+time, .number, code { font-family: ui-monospace, monospace; font-size: .91em; }
+mark { color: #65390e; background: #ffe4ad; padding: .1em .4em; border-radius: .2rem; }
+.panel { padding: .1rem 0 1.25rem; }
+code { overflow-wrap: anywhere; }
+a { color: inherit; text-underline-offset: .16em; }
+ul { padding: 0; margin: .6rem 0 0; list-style: none; }
+li { border-left: 3px solid #d89535; padding: .4rem .8rem; margin-top: .4rem; background: #fcf3e1; }
+footer { padding: 1.2rem 0; }
+@media (max-width: 42rem) {
+  .row { grid-template-columns: 1fr 1.25fr .9fr 1rem; }
+  .tx-count { display: none; }
+  .number, time { font-size: .82rem; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>MARA block explorer</h1>
+  <p>MARA-tagged Bitcoin blocks, with possible Slipstream transactions highlighted.</p>
+</header>
+<main>
+  <div class="toolbar">
+    <h2>Recent blocks</h2>
+    <label><input id="flagged" type="checkbox"> Flagged only</label>
+  </div>
+  <div class="row labels" aria-hidden="true">
+    <span>Height</span><span>Mined (UTC)</span><span class="tx-count">Transactions</span><span>Flagged</span>
+  </div>
+  <div id="blocks"></div>
+  <p id="message" role="status">Loading block reports…</p>
+</main>
+<footer><span id="cursor"></span><span id="source"></span></footer>
+<noscript>Enable JavaScript to view the block reports.</noscript>
+<script>
+const byId = id => document.getElementById(id);
+const number = new Intl.NumberFormat('en-US');
+const date = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'UTC', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false
+});
+let feed;
+const opened = new Set();
+
+function element(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text !== undefined) node.textContent = text;
+  if (className) node.className = className;
+  return node;
+}
+
+function hashLink(kind, hash) {
+  const code = element('code', hash);
+  if (!feed.mainnet || !/^[0-9a-f]{64}$/.test(hash)) return code;
+  const link = element('a');
+  link.href = 'https://mempool.space/' + kind + '/' + hash;
+  link.append(code);
+  return link;
+}
+
+function blockRow(block) {
+  const count = block.findings.length;
+  const row = element('details');
+  row.open = opened.has(block.hash);
+  row.addEventListener('toggle', () => {
+    if (row.isConnected) {
+      if (row.open) opened.add(block.hash);
+      else opened.delete(block.hash);
+    }
+  });
+  const summary = element('summary', undefined, 'row');
+  const height = element('strong', number.format(block.height), 'number');
+  height.setAttribute('aria-label', 'Block ' + block.height);
+  const timestamp = new Date(block.time * 1000);
+  const mined = element('time', date.format(timestamp));
+  mined.dateTime = timestamp.toISOString();
+  const total = element('span', number.format(block.transactions), 'tx-count number');
+  total.setAttribute('aria-label', block.transactions + ' transactions');
+  const flagged = element('span');
+  flagged.append(element(count ? 'mark' : 'span', String(count), 'number'));
+  flagged.setAttribute('aria-label', count + ' flagged transactions');
+  summary.append(height, mined, total, flagged);
+  const panel = element('div', undefined, 'panel');
+  panel.append(element('div', number.format(block.transactions) + ' transactions · Block hash', 'meta'), hashLink('block', block.hash));
+  if (count) {
+    panel.append(element('p', 'Possible Slipstream transactions'));
+    const list = element('ul');
+    for (const finding of block.findings) {
+      const item = element('li');
+      item.append(hashLink('tx', finding.txid));
+      for (const reason of finding.reasons) item.append(element('div', reason, 'reason'));
+      if (finding.slipstream_assessment) item.append(element('div', finding.slipstream_assessment, 'meta'));
+      list.append(item);
+    }
+    panel.append(list);
+  } else {
+    panel.append(element('p', 'No policy exceptions detected.', 'meta'));
+  }
+  row.append(summary, panel);
+  return row;
+}
+
+function render() {
+  const filtered = byId('flagged').checked;
+  const blocks = feed.blocks.filter(block => !filtered || block.findings.length);
+  byId('blocks').replaceChildren(...blocks.map(blockRow));
+  byId('message').textContent = blocks.length ? '' : filtered && feed.blocks.length
+    ? 'No flagged transactions in these MARA blocks.' : 'No MARA blocks recorded yet.';
+  byId('cursor').textContent = feed.height == null ? 'Awaiting first block' : 'Scanned through block ' + number.format(feed.height);
+  byId('source').textContent = feed.snapshot ? 'Snapshot · ' + date.format(new Date(feed.snapshot)) + ' UTC' : 'Refreshes every 30 seconds';
+}
+
+async function update() {
+  try {
+    const response = await fetch('blocks.json', { cache: 'no-store' });
+    if (!response.ok) throw new Error();
+    const next = await response.json();
+    if (!feed) {
+      const firstFlagged = next.blocks.find(block => block.findings.length);
+      if (firstFlagged) opened.add(firstFlagged.hash);
+    }
+    if (JSON.stringify(next) !== JSON.stringify(feed) || byId('message').dataset.failed) {
+      feed = next;
+      render();
+      delete byId('message').dataset.failed;
+    }
+  } catch {
+    byId('message').dataset.failed = '1';
+    byId('message').textContent = feed ? 'Refresh failed. Showing the last loaded reports.' : 'Block reports are unavailable. Retrying in 30 seconds.';
+  }
+  if (!feed?.snapshot) setTimeout(update, 30000);
+}
+
+byId('flagged').addEventListener('change', () => { if (feed) render(); });
+update();
+</script>
+</body>
+</html>

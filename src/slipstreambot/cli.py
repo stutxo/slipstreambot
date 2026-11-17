@@ -8,6 +8,7 @@ import sys
 from uuid import uuid4
 
 from .config import ConfigError, load_config, rpc_options
+from .explorer import serve_explorer
 from .monitor import Monitor
 from .notifications import Notification, NotificationError, build_backends, notify_many
 from .policy import analyze_block, block_notification
@@ -20,6 +21,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verbose", action="store_true")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("watch", help="Watch hashblock ZMQ and reconcile the active RPC chain")
+    explore = commands.add_parser("explore", help="Serve recent MARA block reports on localhost")
+    explore.add_argument("--port", type=int, default=8080, help="Local HTTP port (default: 8080)")
     scan = commands.add_parser("scan", help="Print policy observations for a block without modifying watcher state")
     scan.add_argument("block", help="Block height or 64-character block hash")
     scan.add_argument("--notify", action="store_true", help="Also send resulting MARA alert to configured destinations")
@@ -38,6 +41,9 @@ def main(argv: list[str] | None = None) -> int:
     monitor = None
     try:
         config = load_config(args.config)
+        if args.command == "explore":
+            serve_explorer(config["monitor"]["state_path"], args.port)
+            return 0
         if args.command == "notify":
             backends = build_backends(config["notifiers"])
             notification = Notification(f"manual:{uuid4()}", args.title, args.body, args.url)
