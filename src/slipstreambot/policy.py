@@ -1,5 +1,6 @@
 """Evidence-based comparison of confirmed transactions, not mempool simulation."""
 
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from .scripts import (
@@ -252,19 +253,19 @@ def block_notification(report: dict):
     if report["pool"] != "MARA":
         return None
     findings = report["findings"]
-    summary = f"{len(findings)} tx with Core policy exceptions" if findings else "no policy exceptions detected"
-    lines = [
-        f"Block {report['height']} ({report['hash']})",
-        f"Examined {report['transactions_examined']:,} non-coinbase transactions.",
-        "Coinbase tag attribution; submission route UNPROVEN.",
+    block_time = datetime.fromtimestamp(report["time"], UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    sections = [
+        f"Hash: {report['hash']}\n"
+        f"Time: {block_time}\n"
+        f"Transactions: {report['transactions_examined'] + 1:,}"
     ]
     for finding in findings:
-        lines.append(f"\nTX {finding['txid']} ({finding['weight']:,} WU)")
-        lines.extend(f"- {item['code']}: {item['detail']}" for item in finding["violations"])
-        lines.append(finding["route_assessment"])
-    lines.append("\nPartial policy analysis: Core v32.1 / Libre v31.2; not full script or historical mempool validation.")
+        reasons = "; ".join(item["detail"] for item in finding["violations"])
+        sections.append(f"Possible Slipstream tx: {finding['txid']}\nReason: {reasons}")
+    if not findings:
+        sections.append("No policy exceptions detected.")
     return Notification(
         event_id=f"block:{report['hash']}",
-        title=f"MARA block {report['height']}: {summary}",
-        body="\n".join(lines),
+        title=f"MARA block {report['height']}",
+        body="\n\n".join(sections),
     )

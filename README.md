@@ -1,6 +1,10 @@
 # slipstreambot
 
-Small Python app that watches Bitcoin Core's `hashblock` ZMQ feed, identifies MARA coinbase tags, and sends a notification for every MARA-attributed block. Blocks with no findings receive a "no policy exceptions detected" summary with the block height, hash, and number of non-coinbase transactions examined. Detected exceptions are compared with pinned Libre Relay rules and MARA's published Slipstream exceptions. Blocks attributed to other pools do not trigger notifications.
+Small Python app that watches Bitcoin Core's `hashblock` ZMQ feed, identifies MARA coinbase tags, and sends a notification for every MARA-attributed block. Blocks attributed to other pools do not trigger notifications.
+
+Alerts contain the block height, hash, UTC timestamp, and total transaction count (including coinbase). Each flagged transaction has two fields: `Possible Slipstream tx: <txid>` and `Reason: <policy exception details>`. Multiple reasons are separated by semicolons. Blocks with no findings say `No policy exceptions detected.`
+
+Full policy comparisons against pinned Libre Relay rules and MARA's published Slipstream exceptions remain in the SQLite reports and `scan` JSON output, rather than cluttering notifications.
 
 **A mined transaction cannot prove its submission route.** Alerts say what was observed, not "this used Slipstream". Coinbase tags are also spoofable. This is a structural policy analyzer, not a complete script interpreter or historical mempool simulator; no findings does **not** establish standardness.
 
