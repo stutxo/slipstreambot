@@ -270,21 +270,66 @@ def analyze_block(block: dict, *, mara_tags: tuple[str, ...] | None = None) -> d
     return report
 
 
+def block_signals(report: dict) -> tuple[str, list[dict]]:
+    """Combine transaction-level evidence for explorer rows and MARA alerts."""
+    observation = report.get("mempool") or {}
+    covered = observation.get("status") == "covered"
+    absent = dict.fromkeys(observation["not_observed"] if covered else ())
+    if covered:
+        summary = ("Local mempool before block connection (excluding coinbase): "
+                   f"{observation['seen']:,} seen, {len(absent):,} not observed.")
+        if observation.get("since") is not None:
+            start = datetime.fromtimestamp(observation["since"], UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+            summary += f" Observed since {start}."
+        else:
+            summary += " Observation start unknown."
+    else:
+        summary = "Local mempool coverage before block connection is unknown."
+
+    policy = {finding["txid"]: finding for finding in report["findings"]}
+    findings = []
+    for txid in policy | absent:
+        reasons = []
+        assessment = None
+        if txid in policy:
+            violations = policy[txid].get("violations", [])
+            reasons = [violation["detail"] for violation in violations]
+            comparisons = {violation.get("slipstream") for violation in violations}
+            if "reject" in comparisons:
+                assessment = "An observed exception falls outside a published Slipstream rule."
+            elif comparisons == {"within_published_rule"}:
+                assessment = "The observed exceptions fit published Slipstream rules."
+            else:
+                assessment = "Fit with published Slipstream rules is unknown."
+        if txid in absent:
+            presence = "Not observed in this node's mempool before block connection."
+        elif covered:
+            presence = "Seen in this node's mempool before block connection."
+        else:
+            presence = "Local mempool observation unknown."
+        findings.append({"txid": txid, "reasons": reasons, "mempool_observation": presence,
+                         "slipstream_assessment": assessment})
+    return summary, findings
+
+
 def block_notification(report: dict):
     from .notifications import Notification
 
     if report["pool"] != "MARA":
         return None
-    findings = report["findings"]
+    summary, findings = block_signals(report)
     block_time = datetime.fromtimestamp(report["time"], UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     sections = [
         f"Hash: {report['hash']}\n"
         f"Time: {block_time}\n"
-        f"Transactions: {report['transactions_examined'] + 1:,}"
+        f"Transactions: {report['transactions_examined'] + 1:,}\n"
+        f"{summary}"
     ]
     for finding in findings:
-        reasons = "; ".join(item["detail"] for item in finding["violations"])
-        sections.append(f"Possible Slipstream tx: {finding['txid']}\nReason: {reasons}")
+        reason = finding["mempool_observation"]
+        if finding["reasons"]:
+            reason = "; ".join(finding["reasons"]) + "\n" + reason
+        sections.append(f"Possible Slipstream tx: {finding['txid']}\nReason: {reason}")
     if not findings:
         sections.append("No policy exceptions detected.")
     return Notification(

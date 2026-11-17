@@ -1,12 +1,20 @@
 """Deterministic chain/outbox tests: no node or external message services."""
 
+from collections import deque
+from contextlib import redirect_stdout
+import io
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from slipstreambot.monitor import Monitor
+import zmq
+
+from slipstreambot.cli import main
+from slipstreambot.config import ConfigError, load_config
+from slipstreambot.monitor import Monitor, saved_mempool_evidence
 from slipstreambot.notifications import Notification
 from slipstreambot.rpc import BitcoinRPC, RPCError
 
@@ -292,6 +300,99 @@ class MonitorTests(unittest.TestCase):
         self.assertTrue(monitor._more_work)
         self.assertEqual(monitor.sync_once(), 1)
         self.assertFalse(monitor._more_work)
+
+    def test_late_sequence_boundary_persisted_before_notification(self):
+        self.node.blocks["a2"].update(pool="MARA", tx=[
+            {"txid": "coinbase"}, {"txid": "already-seen"}, {"txid": "unseen"},
+        ])
+        monitor = self.monitor(start=2, zmq_sequence_endpoint="tcp://127.0.0.1:28333")
+        monitor._context = Mock()
+        socket = monitor._context.socket.return_value
+        socket.get_monitor_socket.return_value.poll.return_value = False
+        frames = deque([["A"]])
+        def receive(**kwargs):
+            if frames:
+                return frames.popleft()
+            raise zmq.Again
+        socket.recv_multipart.side_effect = receive
+        def wait_for_connect_frame(_timeout):
+            frames.append(["C"])
+            return True
+        socket.poll.side_effect = wait_for_connect_frame
+        observer = Mock()
+        processed = []
+        def process(frame):
+            processed.append(frame[0])
+            return frame == ["C"]
+        observer.process.side_effect = process
+        observer.has_boundary.side_effect = lambda _hash: "C" in processed
+        observer.observed_before.side_effect = lambda _hash, _parent: (
+            (12345, {"coinbase", "already-seen"}) if "C" in processed else None
+        )
+        monitor._observer = observer
+        monitor.notification = Mock(side_effect=notice)
+        # Admissions do not trigger a block sync. C arrives after getblock RPC.
+        self.assertFalse(monitor._drain_sequence())
+        self.assertEqual(monitor.sync_once(), 1)
+        expected = {"status": "covered", "seen": 1, "not_observed": ["unseen"], "since": 12345}
+        self.assertEqual(monitor.notification.call_args.args[0]["mempool"], expected)
+        self.assertEqual(saved_mempool_evidence(self.path, "a2"), expected)
+        self.assertEqual(saved_mempool_evidence(self.path, "orphan")["status"], "unknown")
+        observer.observed_before.assert_called_once_with("a2", "a1")
+
+    def test_sequence_disconnect_discards_queued_frames(self):
+        monitor = self.monitor(zmq_sequence_endpoint="tcp://127.0.0.1:28333")
+        monitor._context = Mock()
+        monitor._observer = Mock()
+        socket = monitor._context.socket.return_value
+        events = socket.get_monitor_socket.return_value
+        events.poll.return_value = True
+        self.assertFalse(monitor._drain_sequence())
+        self.assertIsNone(monitor._sequence)
+        monitor._observer.reset.assert_called_once()
+        socket.recv_multipart.assert_not_called()
+        socket.close.assert_called_once()
+        events.close.assert_called_once()
+
+    def test_optional_sequence_failure_still_commits_unknown_evidence(self):
+        self.node.blocks["a2"].update(pool="MARA", tx=[{"txid": "coinbase"}, {"txid": "tx"}])
+        monitor = self.monitor(start=2, zmq_sequence_endpoint="tcp://127.0.0.1:28333")
+        monitor._context = Mock()
+        monitor._context.socket.side_effect = zmq.ZMQError("unavailable")
+        self.assertEqual(monitor.sync_once(), 1)
+        self.assertEqual(saved_mempool_evidence(self.path, "a2"),
+                         {"status": "unknown", "seen": 0, "not_observed": [], "since": None})
+        self.assertEqual(self.ids(), ["block:a2"])
+
+    def test_sequence_config_optional_and_validated(self):
+        path = Path(self.directory.name) / "config.toml"
+        path.write_text("[bitcoin]")
+        self.assertNotIn("zmq_sequence_endpoint", load_config(str(path))["bitcoin"])
+        path.write_text('[bitcoin]\nzmq_sequence_endpoint="tcp://127.0.0.1:1234"')
+        self.assertEqual(load_config(str(path))["bitcoin"]["zmq_sequence_endpoint"], "tcp://127.0.0.1:1234")
+        path.write_text("[bitcoin]\nzmq_sequence_endpoint=false")
+        with self.assertRaises(ConfigError):
+            load_config(str(path))
+
+    def test_standalone_scan_reads_exact_hash_without_modifying_state(self):
+        block = {"height": 2, "hash": "a2", "time": 12345, "confirmations": 2,
+                 "tx": [{"vin": [{"coinbase": b"/MARA Pool/".hex()}]}]}
+        monitor = self.monitor(start=2)
+        self.node.blocks["a2"].update(pool="MARA", **block)
+        monitor.sync_once()
+        evidence = {"status": "covered", "seen": 0, "not_observed": [], "since": 12000}
+        with monitor._db:
+            monitor._db.execute("UPDATE blocks SET report=? WHERE hash='a2'",
+                                (json.dumps({"mempool": evidence}),))
+        config = Path(self.directory.name) / "scan.toml"
+        config.write_text('[monitor]\nstate_path="state.sqlite3"')
+        output = io.StringIO()
+        with patch("slipstreambot.cli.BitcoinRPC", return_value=self.node), redirect_stdout(output):
+            self.assertEqual(main(["--config", str(config), "scan", "2"]), 0)
+        self.assertEqual(json.loads(output.getvalue())["mempool"], evidence)
+        missing = config.with_name("absent.sqlite3")
+        self.assertEqual(saved_mempool_evidence(str(missing), "a2")["status"], "unknown")
+        self.assertFalse(missing.exists())
 
 
 class RPCTests(unittest.TestCase):

@@ -7,21 +7,10 @@ import logging
 from pathlib import Path
 import sqlite3
 
+from .policy import block_signals
+
 
 MAINNET_GENESIS = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
-
-
-def _finding_summary(finding: dict) -> dict:
-    violations = finding.get("violations", [])
-    comparisons = {violation.get("slipstream") for violation in violations}
-    if "reject" in comparisons:
-        assessment = "An observed exception falls outside a published Slipstream rule."
-    elif comparisons == {"within_published_rule"}:
-        assessment = "The observed exceptions fit published Slipstream rules."
-    else:
-        assessment = "Fit with published Slipstream rules is unknown."
-    return {"txid": finding["txid"], "reasons": [v["detail"] for v in violations],
-            "slipstream_assessment": assessment}
 
 
 def read_blocks(state_path: str | Path) -> dict:
@@ -41,10 +30,13 @@ def read_blocks(state_path: str | Path) -> dict:
         blocks = []
         for height, block_hash, raw_report in rows:
             report = json.loads(raw_report)
+            summary, findings = block_signals(report)
+            mempool = report.get("mempool") or {}
+            missed = len(set(mempool["not_observed"])) if mempool.get("status") == "covered" else None
             blocks.append({
                 "height": height, "hash": block_hash, "time": report["time"],
                 "transactions": report["transactions_examined"] + 1,
-                "findings": [_finding_summary(finding) for finding in report["findings"]],
+                "mempool_summary": summary, "mempool_not_observed": missed, "findings": findings,
             })
     return {"height": state[0] if state else None,
             "mainnet": state is not None and state[1] == MAINNET_GENESIS, "blocks": blocks}

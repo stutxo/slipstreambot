@@ -5,6 +5,8 @@ cookie_file = "~/.bitcoin/.cookie"
 # rpc_user = "slipstreambot"
 # rpc_password_env = "BITCOIN_RPC_PASSWORD"
 zmq_endpoint = "tcp://127.0.0.1:28332"
+# Optional, must match Bitcoin Core's zmqpubsequence endpoint on this node.
+# zmq_sequence_endpoint = "tcp://127.0.0.1:28333"
 timeout = 30
 
 [monitor]

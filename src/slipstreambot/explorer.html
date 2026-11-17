@@ -15,7 +15,7 @@ p { margin: .65rem 0 0; }
 .toolbar, footer { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: .6rem; }
 .toolbar { margin: 2rem 0 1.2rem; }
 h2 { margin: 0; font-size: 1.25rem; }
-input { accent-color: #43563d; }
+select { font: inherit; color: inherit; }
 .row { display: grid; grid-template-columns: 1.1fr 1.6fr 1fr 1fr 1rem; align-items: baseline; gap: .5rem; }
 .labels { padding-bottom: .5rem; border-bottom: 1px solid #c8cdc1; }
 details { border-bottom: 1px solid #d6dacf; font-variant-numeric: tabular-nums; }
@@ -42,12 +42,16 @@ footer { padding: 1.2rem 0; }
 <body>
 <header>
   <h1>MARA block explorer</h1>
-  <p>MARA-tagged Bitcoin blocks, with possible Slipstream transactions highlighted.</p>
+  <p>MARA-tagged Bitcoin blocks. Possible Slipstream signals include policy exceptions and transactions missing from this node’s mempool observations.</p>
 </header>
 <main>
   <div class="toolbar">
     <h2>Recent blocks</h2>
-    <label><input id="flagged" type="checkbox"> Flagged only</label>
+    <select id="filter" aria-label="Filter blocks">
+      <option value="all">All blocks</option>
+      <option value="flagged">Flagged blocks</option>
+      <option value="misses">Mempool misses</option>
+    </select>
   </div>
   <div class="row labels" aria-hidden="true">
     <span>Height</span><span>Mined (UTC)</span><span class="tx-count">Transactions</span><span>Flagged</span>
@@ -106,12 +110,14 @@ function blockRow(block) {
   summary.append(height, mined, total, flagged);
   const panel = element('div', undefined, 'panel');
   panel.append(element('div', number.format(block.transactions) + ' transactions · Block hash', 'meta'), hashLink('block', block.hash));
+  panel.append(element('p', block.mempool_summary || 'Local mempool coverage before block connection is unknown.', 'meta'));
   if (count) {
     panel.append(element('p', 'Possible Slipstream transactions'));
     const list = element('ul');
     for (const finding of block.findings) {
       const item = element('li');
       item.append(hashLink('tx', finding.txid));
+      item.append(element('div', finding.mempool_observation || 'Local mempool observation unknown.', 'reason'));
       for (const reason of finding.reasons) item.append(element('div', reason, 'reason'));
       if (finding.slipstream_assessment) item.append(element('div', finding.slipstream_assessment, 'meta'));
       list.append(item);
@@ -125,11 +131,20 @@ function blockRow(block) {
 }
 
 function render() {
-  const filtered = byId('flagged').checked;
-  const blocks = feed.blocks.filter(block => !filtered || block.findings.length);
+  const filter = byId('filter').value;
+  let blocks = feed.blocks;
+  let empty = 'No MARA blocks recorded yet.';
+  if (filter === 'flagged') {
+    blocks = blocks.filter(block => block.findings.length);
+    if (feed.blocks.length) empty = 'No flagged transactions in these MARA blocks.';
+  } else if (filter === 'misses') {
+    blocks = blocks.filter(block => block.mempool_not_observed > 0);
+    empty = feed.blocks.some(block => Number.isInteger(block.mempool_not_observed))
+      ? 'No mempool misses in the MARA blocks with observation coverage.'
+      : 'No MARA blocks with local mempool coverage yet.';
+  }
   byId('blocks').replaceChildren(...blocks.map(blockRow));
-  byId('message').textContent = blocks.length ? '' : filtered && feed.blocks.length
-    ? 'No flagged transactions in these MARA blocks.' : 'No MARA blocks recorded yet.';
+  if (!byId('message').dataset.failed) byId('message').textContent = blocks.length ? '' : empty;
   byId('cursor').textContent = feed.height == null ? 'Awaiting first block' : 'Scanned through block ' + number.format(feed.height);
   byId('source').textContent = feed.snapshot ? 'Snapshot · ' + date.format(new Date(feed.snapshot)) + ' UTC' : 'Refreshes every 30 seconds';
 }
@@ -145,8 +160,8 @@ async function update() {
     }
     if (JSON.stringify(next) !== JSON.stringify(feed) || byId('message').dataset.failed) {
       feed = next;
-      render();
       delete byId('message').dataset.failed;
+      render();
     }
   } catch {
     byId('message').dataset.failed = '1';
@@ -155,7 +170,7 @@ async function update() {
   if (!feed?.snapshot) setTimeout(update, 30000);
 }
 
-byId('flagged').addEventListener('change', () => { if (feed) render(); });
+byId('filter').addEventListener('change', () => { if (feed) render(); });
 update();
 </script>
 </body>

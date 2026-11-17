@@ -7,6 +7,7 @@ from that boundary, not from unmonitored historical blocks.
 
 from __future__ import annotations
 
+from contextlib import closing
 import fcntl
 import json
 import logging
@@ -19,10 +20,31 @@ from typing import Callable
 
 import zmq
 
+from .mempool import MempoolObserver
 from .notifications import Backend, Notification
 from .rpc import RPCError
 
 LOG = logging.getLogger(__name__)
+
+
+def _unknown_mempool() -> dict:
+    return {"status": "unknown", "seen": 0, "not_observed": [], "since": None}
+
+
+def saved_mempool_evidence(state_path: str, block_hash: str) -> dict:
+    """Recover a live observation for a one-shot scan of the same block."""
+    path = Path(state_path).expanduser().resolve()
+    if path.is_file():
+        try:
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                row = db.execute("SELECT report FROM blocks WHERE hash=?", (block_hash,)).fetchone()
+                if row:
+                    evidence = json.loads(row[0]).get("mempool")
+                    if evidence is not None:
+                        return evidence
+        except (sqlite3.Error, ValueError):
+            LOG.warning("Saved mempool evidence unavailable for block %s", block_hash)
+    return _unknown_mempool()
 
 
 class Monitor:
@@ -33,7 +55,7 @@ class Monitor:
                  analyze: Callable[[dict], dict],
                  notification: Callable[[dict], Notification | None],
                  backends: list[Backend], poll_seconds: float = 30,
-                 start_height: int | None = None) -> None:
+                 start_height: int | None = None, zmq_sequence_endpoint: str | None = None) -> None:
         if poll_seconds <= 0:
             raise ValueError("Monitor poll_seconds must be positive")
         if start_height is not None and (
@@ -44,6 +66,11 @@ class Monitor:
             raise ValueError("Notification backend names must be unique")
         self.rpc = rpc
         self.zmq_endpoint = zmq_endpoint
+        self._sequence_endpoint = zmq_sequence_endpoint
+        self._observer = MempoolObserver(rpc) if zmq_sequence_endpoint else None
+        self._sequence = None
+        self._connection_events = None
+        self._sequence_retry = 0.0
         self.analyze = analyze
         self.notification = notification
         self.backends = list(backends)
@@ -196,6 +223,75 @@ class Monitor:
                 if len(rows) == self.DELIVERY_BATCH_SIZE:
                     self._more_work = True
 
+    def _close_sequence(self) -> None:
+        if self._connection_events is not None:
+            self._connection_events.close(linger=0)
+            self._connection_events = None
+        if self._sequence is not None:
+            self._sequence.close(linger=0)
+            self._sequence = None
+        if self._observer is not None:
+            self._observer.reset()
+
+    def _drain_sequence(self, wait_ms: int = 0) -> bool:
+        """Consume a bounded batch. Only chain events should wake reconciliation."""
+        if self._observer is None or self._context is None:
+            return False
+        try:
+            if self._sequence is None:
+                if time.monotonic() < self._sequence_retry:
+                    return False
+                self._sequence = self._context.socket(zmq.SUB)
+                self._sequence.setsockopt(zmq.LINGER, 0)
+                self._sequence.setsockopt(zmq.RCVHWM, 16_384)
+                self._sequence.setsockopt(zmq.SUBSCRIBE, b"sequence")
+                self._connection_events = self._sequence.get_monitor_socket(events=zmq.EVENT_DISCONNECTED)
+                self._sequence.connect(self._sequence_endpoint)
+                LOG.info("Subscribed to local mempool sequence events; awaiting a block boundary")
+            if self._connection_events.poll(0):
+                # A fresh socket discards old frames still buffered across a reconnect.
+                self._close_sequence()
+                return False
+            if wait_ms and not self._sequence.poll(wait_ms):
+                return False
+            block_event = False
+            for _ in range(4096):
+                try:
+                    frames = self._sequence.recv_multipart(flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    break
+                if self._observer.process(frames):
+                    block_event = True
+            if self._connection_events.poll(0):
+                self._close_sequence()
+                return False
+            return block_event
+        except zmq.ZMQError:
+            LOG.warning("Sequence subscription unavailable; continuing block monitoring")
+            self._close_sequence()
+            self._sequence_retry = time.monotonic() + self.poll_seconds
+            return False
+
+    def _mempool_evidence(self, block: dict, *, at_tip: bool) -> dict:
+        if self._observer is None:
+            return _unknown_mempool()
+        # hashblock, sequence and RPC can announce a block in different orders.
+        # A missing C frame stays unknown; historical catch-up never waits for one.
+        self._drain_sequence()
+        block_hash = block["hash"]
+        deadline = time.monotonic() + 0.5
+        while (at_tip and self._sequence is not None and not self._stop.is_set()
+               and not self._observer.has_boundary(block_hash) and time.monotonic() < deadline):
+            self._drain_sequence(wait_ms=50)
+        cut = self._observer.observed_before(block_hash, block.get("previousblockhash", ""))
+        if cut is None:
+            return _unknown_mempool()
+        since, observed = cut
+        txids = [tx["txid"] for tx in block["tx"][1:]]
+        missing = [txid for txid in txids if txid not in observed]
+        return {"status": "covered", "seen": len(txids) - len(missing), "not_observed": missing,
+                "since": since}
+
     def sync_once(self) -> int:
         """Reconcile and commit at most BATCH_SIZE blocks, then attempt each sink.
 
@@ -211,17 +307,20 @@ class Monitor:
         height, previous = state["height"] + 1, state["hash"]
         processed = 0
         while height <= tip and processed < self.BATCH_SIZE and not self._stop.is_set():
+            self._drain_sequence()
             block_hash = self.rpc.call("getblockhash", height)
             block = self.rpc.call("getblock", block_hash, 3)
             if block.get("hash") != block_hash or block.get("height") != height:
                 raise RPCError("RPC returned block data inconsistent with the requested hash and height")
-            if self.rpc.call("getblockhash", height) != block_hash:
-                self._more_work = True
-                break
             if height > 0 and previous and block.get("previousblockhash") != previous:
                 self._more_work = True
                 break
             report = self.analyze(block)
+            if report.get("pool") == "MARA":
+                report["mempool"] = self._mempool_evidence(block, at_tip=height == tip)
+            if self.rpc.call("getblockhash", height) != block_hash:
+                self._more_work = True
+                break
             notice = self.notification(report)
             encoded = json.dumps(report, separators=(",", ":"), allow_nan=False)
             with self._db:
@@ -232,8 +331,13 @@ class Monitor:
                         self._enqueue(backend.name, block_hash, "report", notice)
                 self._db.execute("UPDATE chain_state SET height=?,hash=? WHERE singleton=1",
                                  (height, block_hash))
-            LOG.info("Processed block %d %s: pool=%s findings=%d",
-                     height, block_hash, report.get("pool"), len(report.get("findings", [])))
+            observation = report.get("mempool")
+            detail = ""
+            if observation:
+                unseen = len(observation["not_observed"]) if observation["status"] == "covered" else "unknown"
+                detail = f" mempool_not_observed={unseen}"
+            LOG.info("Processed block %d %s: pool=%s policy_findings=%d%s",
+                     height, block_hash, report.get("pool"), len(report.get("findings", [])), detail)
             processed += 1
             height += 1
             previous = block_hash
@@ -255,20 +359,23 @@ class Monitor:
             self._socket.setsockopt(zmq.RCVHWM, 1000)
             self._socket.setsockopt(zmq.SUBSCRIBE, b"hashblock")
             self._socket.connect(self.zmq_endpoint)
+            self._drain_sequence()
             LOG.info("Watching hashblock ZMQ; reconciling RPC every %s seconds", self.poll_seconds)
             while not self._stop.is_set():
+                retrying = False
                 try:
                     self.sync_once()
                 except RPCError as exc:
                     LOG.error("Chain synchronization failed: %s", exc)
-                    self._stop.wait(self.poll_seconds)
-                    continue
-                if self._more_work:
+                    retrying = True
+                if self._more_work and not retrying:
                     continue
                 deadline = time.monotonic() + self.poll_seconds
                 while not self._stop.is_set():
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
+                        break
+                    if self._drain_sequence() and not retrying:
                         break
                     if self._socket.poll(max(1, min(250, int(remaining * 1000)))):
                         for _ in range(1000):
@@ -276,7 +383,8 @@ class Monitor:
                                 self._socket.recv_multipart(flags=zmq.NOBLOCK)
                             except zmq.Again:
                                 break
-                        break
+                        if not retrying:
+                            break
         except KeyboardInterrupt:
             self._stop.set()
         finally:
@@ -290,6 +398,7 @@ class Monitor:
         self._closed = True
         self._stop.set()
         try:
+            self._close_sequence()
             if self._socket is not None:
                 self._socket.close(linger=0)
             if self._context is not None:

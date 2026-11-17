@@ -25,12 +25,17 @@ def load_config(path: str) -> dict:
         raise ConfigError("bitcoin and monitor must be TOML tables")
     if not isinstance(notifiers, list) or not all(isinstance(n, dict) for n in notifiers):
         raise ConfigError("notifiers must be an array of TOML tables")
-    if set(bitcoin) - {"rpc_url", "cookie_file", "rpc_user", "rpc_password_env", "zmq_endpoint", "timeout"}:
+    if set(bitcoin) - {"rpc_url", "cookie_file", "rpc_user", "rpc_password_env", "zmq_endpoint",
+                       "zmq_sequence_endpoint", "timeout"}:
         raise ConfigError("Unknown bitcoin option")
     if set(monitor) - {"state_path", "poll_seconds", "start_height", "mara_tags"}:
         raise ConfigError("Unknown monitor option")
     bitcoin.setdefault("rpc_url", "http://127.0.0.1:8332")
     bitcoin.setdefault("zmq_endpoint", "tcp://127.0.0.1:28332")
+    if "zmq_sequence_endpoint" in bitcoin and (
+        not isinstance(bitcoin["zmq_sequence_endpoint"], str) or not bitcoin["zmq_sequence_endpoint"].strip()
+    ):
+        raise ConfigError("zmq_sequence_endpoint must be a nonempty endpoint string")
     bitcoin.setdefault("timeout", 30)
     if not bitcoin.get("rpc_user") and not bitcoin.get("cookie_file"):
         bitcoin["cookie_file"] = "~/.bitcoin/.cookie"
