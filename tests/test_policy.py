@@ -1,7 +1,7 @@
 import copy
 import unittest
 
-from slipstreambot.policy import analyze_block, analyze_transaction
+from slipstreambot.policy import analyze_block, analyze_transaction, block_notification
 from slipstreambot.scripts import operations, script_kind
 
 
@@ -36,6 +36,17 @@ def codes(tx):
 
 
 class PolicyTests(unittest.TestCase):
+    def test_mara_blocks_without_findings_still_produce_notifications(self):
+        for transactions in ([], [transaction()]):
+            with self.subTest(transactions=len(transactions)):
+                block = {"height": 123, "hash": "cd" * 32, "time": 1234,
+                         "tx": [{"vin": [{"coinbase": b"/MARA Pool/".hex()}]}, *transactions]}
+                report = analyze_block(block)
+                notice = block_notification(report)
+                self.assertEqual(report["findings"], [])
+                self.assertIsNotNone(notice)
+                self.assertEqual(notice.event_id, f"block:{block['hash']}")
+
     def test_current_op_return_rules_do_not_use_old_83_byte_limit(self):
         tx = transaction()
         tx["vout"] += [output(b"\x6a" + push(b"a" * 1000), "0"), output(b"\x6a\x01x", "0")]
@@ -140,8 +151,10 @@ class PolicyTests(unittest.TestCase):
         report = analyze_block(block)
         self.assertEqual(report["pool"], "MARA")
         self.assertEqual(report["findings"][0]["txid"], tx["txid"])
+        self.assertIn(tx["txid"], block_notification(report).body)
         block["tx"][0]["vin"][0]["coinbase"] = b"/OtherPool/".hex()
         self.assertEqual(analyze_block(block)["findings"], [])
+        self.assertIsNone(block_notification(analyze_block(block)))
 
     def test_malformed_push_and_unknown_witness_output(self):
         with self.assertRaises(ValueError):

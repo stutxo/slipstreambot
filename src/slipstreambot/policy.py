@@ -249,10 +249,15 @@ def analyze_block(block: dict, *, mara_tags: tuple[str, ...] | None = None) -> d
 def block_notification(report: dict):
     from .notifications import Notification
 
-    if report["pool"] != "MARA" or not report["findings"]:
+    if report["pool"] != "MARA":
         return None
     findings = report["findings"]
-    lines = [f"Block {report['height']} ({report['hash']})", "Coinbase tag attribution; submission route UNPROVEN."]
+    summary = f"{len(findings)} tx with Core policy exceptions" if findings else "no policy exceptions detected"
+    lines = [
+        f"Block {report['height']} ({report['hash']})",
+        f"Examined {report['transactions_examined']:,} non-coinbase transactions.",
+        "Coinbase tag attribution; submission route UNPROVEN.",
+    ]
     for finding in findings:
         lines.append(f"\nTX {finding['txid']} ({finding['weight']:,} WU)")
         lines.extend(f"- {item['code']}: {item['detail']}" for item in finding["violations"])
@@ -260,6 +265,6 @@ def block_notification(report: dict):
     lines.append("\nPartial policy analysis: Core v32.1 / Libre v31.2; not full script or historical mempool validation.")
     return Notification(
         event_id=f"block:{report['hash']}",
-        title=f"MARA: {len(findings)} tx with Core policy exceptions",
+        title=f"MARA block {report['height']}: {summary}",
         body="\n".join(lines),
     )
