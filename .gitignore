@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+.env
+.env.*
+!.env.example
+config.toml
+*.sqlite*
+*.db*
+*.lock
+!uv.lock
+state/
+.coverage

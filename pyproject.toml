@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "slipstreambot"
+version = "0.1.0"
+description = "MARA block policy monitor with reusable notification backends"
+requires-python = ">=3.11"
+dependencies = [
+  "pyzmq>=26,<28",
+  "requests>=2.32.4,<3",
+  "requests-oauthlib>=2,<3",
+]
+
+[project.scripts]
+slipstreambot = "slipstreambot.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/slipstreambot"]

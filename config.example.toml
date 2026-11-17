@@ -1,0 +1,37 @@
+[bitcoin]
+rpc_url = "http://127.0.0.1:8332"
+cookie_file = "~/.bitcoin/.cookie"
+# For a remote node, remove cookie_file and set:
+# rpc_user = "slipstreambot"
+# rpc_password_env = "BITCOIN_RPC_PASSWORD"
+zmq_endpoint = "tcp://127.0.0.1:28332"
+timeout = 30
+
+[monitor]
+state_path = "state/slipstreambot.sqlite3"
+poll_seconds = 30
+# First run defaults to current tip. Set an inclusive height for backfill.
+# start_height = 900000
+# Override tags only when needed; defaults include current MARA Stratum V2 tags.
+# mara_tags = ["MARA Pool", "MARA Made in USA", "mara_pool_sv2", "mara-pool-sv2", "mara_jdc_sv2", "Sv2/MARA"]
+
+[[notifiers]]
+kind = "console"
+
+# [[notifiers]]
+# kind = "ntfy"
+# server = "https://ntfy.sh"
+# topic = "your-private-topic"
+# token_env = "NTFY_TOKEN" # optional; prefer access-controlled topics
+
+# [[notifiers]]
+# kind = "telegram"
+# token_env = "TELEGRAM_BOT_TOKEN"
+# chat_id = "your-chat-id"
+
+# [[notifiers]]
+# kind = "twitter"
+# consumer_key_env = "X_CONSUMER_KEY"
+# consumer_secret_env = "X_CONSUMER_SECRET"
+# access_token_env = "X_ACCESS_TOKEN"
+# access_token_secret_env = "X_ACCESS_TOKEN_SECRET"
